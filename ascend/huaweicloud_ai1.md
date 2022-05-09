@@ -18,7 +18,7 @@
 
     从昇腾官方下载最新的驱动和开发包
 
-    - [CANN-NNRT](https://www.hiascend.com/software/cann/community)
+    - [CANN-NNRT](https://www.hiascend.com/software/cann/community)(NNRT是推理运行时包，开发环境可以不用安装，已被toolkit集成）
     - [CANN-TOOLKIT](https://www.hiascend.com/software/cann/community)
     - [Ascend 310 driver](https://www.hiascend.com/hardware/firmware-drivers?tag=community)
 
