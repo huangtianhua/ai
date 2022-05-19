@@ -5,6 +5,8 @@
 <!-- code_chunk_output -->
 
 - [ONNX Runtime](#onnx-runtime)
+  - [OpSchema Registry](#opschema-registry)
+  - [OpSchema Management](#opschema-management)
   - [Kernel Implementation](#kernel-implementation)
   - [Kernel Registry](#kernel-registry)
   - [Kernel Management](#kernel-management)
@@ -12,6 +14,196 @@
   - [Kernel Run](#kernel-run)
 
 <!-- /code_chunk_output -->
+
+## OpSchema Registry
+
+```c++
+ONNX_OPERATOR_SET_SCHEMA(
+    Add,
+    1,
+    OpSchema().FillUsing(MathDocGenerator_old("addition")));
+
+OpSchema() : OpSchema("unknown", "unknown", 0) {}
+
+OpSchema& OpSchema::FillUsing(const std::function<void(OpSchema&)>& populator) {
+  if (populator) {
+    populator(*this);
+  }
+  return *this;
+}
+
+std::function<void(OpSchema&)> MathDocGenerator_old(const char* name) {
+  return [=](OpSchema& schema) {
+    std::string doc;
+    POPULATE_OP_DOC_STR(doc = R"DOC(
+Performs element-wise binary {name} (with limited broadcast support).
+{broadcast_doc})DOC";
+                        ReplaceAll(doc, "{name}", name);
+                        ReplaceAll(doc, "{broadcast_doc}", kBroadcastDoc_old););
+    schema.SetDoc(doc);
+    schema.Attr(
+        "broadcast",
+        "Pass 1 to enable broadcasting",
+        AttributeProto::INT,
+        static_cast<int64_t>(0));
+
+    // This attribute was added via AllowConsumed API in OpSchema.
+    // After removing the API, we're now using the Attr API to simulate the old
+    // definition.
+    schema.Attr(
+        "consumed_inputs",
+        "legacy optimization attribute.",
+        AttributeProto::INTS,
+        OPTIONAL_VALUE);
+    schema.Attr(
+        "axis",
+        "If set, defines the broadcast dimensions. See doc for details.",
+        AttributeProto::INT,
+        OPTIONAL_VALUE);
+    schema.Input(
+        0,
+        "A",
+        "First operand, should share the type with the second operand.",
+        "T");
+    schema.Input(
+        1,
+        "B",
+        "Second operand. With broadcasting can be of smaller size than A. "
+        "If broadcasting is disabled it should be of the same size.",
+        "T");
+    schema.Output(0, "C", "Result, has same dimensions and type as A", "T");
+    schema.TypeConstraint(
+        "T",
+        {"tensor(float16)", "tensor(float)", "tensor(double)"},
+        "Constrain input and output types to float tensors.");
+  };
+}
+
+#define ONNX_OPERATOR_SET_SCHEMA(name, ver, impl) \
+  ONNX_OPERATOR_SET_SCHEMA_EX(name, Onnx, ONNX_DOMAIN, ver, true, impl)
+
+#define ONNX_OPERATOR_SET_SCHEMA_EX(                                        \
+    name, domain, domain_str, ver, dbg_included_in_static_opset, impl)      \
+  class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(domain, ver, name);             \
+  template <>                                                               \
+  OpSchema                                                                  \
+  GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(domain, ver, name)>() {   \
+    return impl.SetName(#name)                                              \
+        .SetDomain(domain_str)                                              \
+        .SinceVersion(ver)                                                  \
+        .SetLocation(__FILE__, __LINE__);                                   \
+  }                                                                         \
+  size_t dbg_count_check_##name##_##domain##_ver##ver =                     \
+      (dbg_included_in_static_opset) ? ONNX_DBG_INCREMENT_COUNT_IN_OPSETS() \
+                                     : 0;
+```
+
+## OpSchema Management
+
+```c++
+inline void RegisterOnnxOperatorSetSchema() {
+  RegisterOpSetSchema<OpSet_Onnx_ver1>();
+  RegisterOpSetSchema<OpSet_Onnx_ver2>();
+  RegisterOpSetSchema<OpSet_Onnx_ver3>();
+  RegisterOpSetSchema<OpSet_Onnx_ver4>();
+  RegisterOpSetSchema<OpSet_Onnx_ver5>();
+  RegisterOpSetSchema<OpSet_Onnx_ver6>();
+  RegisterOpSetSchema<OpSet_Onnx_ver7>();
+  RegisterOpSetSchema<OpSet_Onnx_ver8>();
+  RegisterOpSetSchema<OpSet_Onnx_ver9>();
+  RegisterOpSetSchema<OpSet_Onnx_ver10>();
+  RegisterOpSetSchema<OpSet_Onnx_ver11>();
+  RegisterOpSetSchema<OpSet_Onnx_ver12>();
+  RegisterOpSetSchema<OpSet_Onnx_ver13>();
+  RegisterOpSetSchema<OpSet_Onnx_ver14>();
+  RegisterOpSetSchema<OpSet_Onnx_ver15>();
+  RegisterOpSetSchema<OpSet_Onnx_ver16>();
+  // 0 means all versions of ONNX schema have been loaded
+  OpSchemaRegistry::Instance()->SetLoadedSchemaVersion(0);
+}
+
+class OpSet_Onnx_ver1 {
+ public:
+  static void ForEachSchema(std::function<void(OpSchema&&)> fn) {
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 1, Abs)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 1, Add)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 1, And)>());
+    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Onnx, 1, ArgMax)>());
+    ...
+  }
+};
+
+template <class T>
+void RegisterOpSetSchema(int opset_version_to_load=0) {
+  T::ForEachSchema([opset_version_to_load](OpSchema&& schema) {
+    RegisterSchema(schema, opset_version_to_load);
+  });
+};
+
+void RegisterSchema(OpSchema schema, int opset_version_to_load) {
+  OpSchemaRegistry::OpSchemaRegisterOnce ONNX_UNUSED registration(schema, opset_version_to_load);
+}
+
+class OpSchemaRegisterOnce final {
+  public:
+  OpSchemaRegisterOnce(OpSchema& op_schema) {
+    try {
+      op_schema.Finalize();
+
+      auto& m = GetMapWithoutEnsuringRegistration();
+
+      auto& op_name = op_schema.Name();
+      auto& op_domain = op_schema.domain();
+      auto ver = op_schema.SinceVersion();
+
+      if (m[op_name][op_domain].count(ver)) {
+        const auto& schema = m[op_name][op_domain][ver];
+        std::stringstream err;
+        err << "Trying to register schema with name " << op_name
+            << " (domain: " << op_domain << " version: " << ver
+            << ") from file " << op_schema.file() << " line "
+            << op_schema.line() << ", but it is already registered from file "
+            << schema.file() << " line " << schema.line() << std::endl;
+        fail_schema(err.str());
+      }
+
+      auto ver_range_map = DomainToVersionRange::Instance().Map();
+      auto ver_range_it = ver_range_map.find(op_domain);
+      if (ver_range_it == ver_range_map.end()) {
+        std::stringstream err;
+        err << "Trying to register schema with name " << op_name
+            << " (domain: " << op_domain << " version: " << ver
+            << ") from file " << op_schema.file() << " line "
+            << op_schema.line() << ", but it its domain is not"
+            << " known by the checker." << std::endl;
+
+        fail_schema(err.str());
+      }
+      auto lower_bound_incl = ver_range_it->second.first;
+      auto upper_bound_incl = ver_range_it->second.second;
+      if (!(lower_bound_incl <= ver && upper_bound_incl >= ver)) {
+        std::stringstream err;
+        err << "Trying to register schema with name " << op_name
+            << " (domain: " << op_domain << " version: " << ver
+            << ") from file " << op_schema.file() << " line "
+            << op_schema.line() << ", but it its version is not "
+            << "in the inclusive range [" << lower_bound_incl << ", "
+            << upper_bound_incl << "] (usually, this means you "
+            << "bumped the operator version but "
+            << "forgot to update the version range in DomainToVersionRange "
+            << "in onnx/defs/schema.h)." << std::endl;
+        fail_schema(err.str());
+      }
+
+      m[op_name][op_domain].insert(
+          std::pair<int, OpSchema&&>(ver, std::move(op_schema)));
+
+    } catch (const std::exception& e) {
+      std::cerr << "Schema error: " << e.what() << std::endl;
+    }
+  }
+};
+```
 
 ## Kernel Implementation
 
@@ -259,17 +451,6 @@ class KernelRegistry {
     auto it = kernel_creator_fn_map_.emplace(key, std::move(create_info));
     ...
     return Status::OK();
-  }
-  
-  static std::string GetMapKey(const std::string& op_name, const std::string& domain, const std::string& provider) {
-    std::string key(op_name);
-    // use the kOnnxDomainAlias of 'ai.onnx' instead of kOnnxDomain's empty string
-    key.append(1, ' ').append(domain.empty() ? kOnnxDomainAlias : domain).append(1, ' ').append(provider);
-    return key;
-  }
-  
-  static std::string GetMapKey(const KernelDef& kernel_def) {
-    return GetMapKey(kernel_def.OpName(), kernel_def.Domain(), kernel_def.Provider());
   }
 
   // Kernel create function map from op name to kernel creation info.
@@ -533,164 +714,5 @@ Status SequentialExecutor::Execute(const SessionState& session_state, const std:
 
 const OpKernel* GetKernel(size_t node_id) const {
   return (node_id < session_kernels_.size()) ? session_kernels_[node_id].get() : nullptr;
-}
-```
-
-```c++
-// TODO: Tell user why it has conflicts
-// TODO: Investigate why IsConflict() was not triggered when there were duplicate Tile CUDA
-// kernels registered. Removing `InputMemoryType(OrtMemTypeCPUInput, 1)` in the kernel definition
-// triggered the conflict.
-bool KernelDef::IsConflict(const KernelDef& other) const {
-  if (op_name_ != other.OpName() || provider_type_ != other.Provider())
-    return false;
-  int other_since_version_start = 0;
-  int other_since_version_end = 0;
-  other.SinceVersion(&other_since_version_start, &other_since_version_end);
-
-  //When max version is INT_MAX, it means that it should be determined based on the
-  //SinceVersion of schema from a higher version.  Since this sometimes isn't known until
-  //all custom schema are available, make a conservative assumption here that the operator
-  //is valid for only one version.
-  int op_since_version_conservative_end = (op_since_version_end_ == INT_MAX) ? op_since_version_start_ : op_since_version_end_;
-  int other_conservative_since_version_end = (other_since_version_end == INT_MAX) ? other_since_version_start : other_since_version_end;
-
-  if (!AreIntervalsOverlap(op_since_version_start_, op_since_version_conservative_end, other_since_version_start, other_conservative_since_version_end))
-    return false;
-  //only one case they don't conflict:
-  //There is a type_constraint, it exists in both hands, but they don't overlap
-  //check types
-  const auto& other_types = other.default_type_constraints_;
-  bool type_has_conflict = true;
-  for (const auto& it : default_type_constraints_) {
-    auto iter = other_types.find(it.first);
-    if (iter != other_types.end()) {
-      if (!AreVectorsOverlap(it.second, iter->second)) {
-        type_has_conflict = false;
-        break;
-      }
-    }
-  }
-  if (!type_has_conflict)
-    return false;
-  //if has type conflict, check if any other field has different
-  //for example, we register two kernel with float type, but one is inplace, another is not.
-  //check in-place
-  if (inplace_map_.empty() && !other.MayInplace().empty())
-    return false;
-  for (auto& it : inplace_map_) {
-    if (std::find(other.MayInplace().begin(), other.MayInplace().end(), it) == other.MayInplace().end())
-      return false;
-  }
-
-  //check alias
-  for (auto& it : alias_map_) {
-    if (std::find(other.Alias().begin(), other.Alias().end(), it) == other.Alias().end())
-      return false;
-  }
-  if (alias_map_.empty() && !other.Alias().empty())
-    return false;
-
-  //check memory type
-  auto& other_input_mem_types = other.input_memory_type_args_;
-  for (auto it : input_memory_type_args_) {
-    if (other_input_mem_types.count(it.first) && other_input_mem_types.find(it.first)->second == it.second)
-      return false;
-  }
-  if (input_memory_type_args_.empty() && !other.input_memory_type_args_.empty())
-    return false;
-
-  auto& other_output_mem_types = other.output_memory_type_args_;
-  for (auto it : output_memory_type_args_) {
-    if (other_output_mem_types.count(it.first) && other_output_mem_types.find(it.second)->second == it.second)
-      return false;
-  }
-  return !(output_memory_type_args_.empty() && !other.output_memory_type_args_.empty());
-}
-
-bool KernelRegistry::VerifyKernelDef(const Node& node,
-                                     const KernelDef& kernel_def,
-                                     std::string& error_str) {
-  // check if version matches
-  int kernel_start_version;
-  int kernel_end_version;
-  kernel_def.SinceVersion(&kernel_start_version, &kernel_end_version);
-
-  int node_since_version = node.SinceVersion();
-  // Ideal case is, if schema is Since(5), current opset version is opset 7,
-  // kernel_def Since(8)     Invalid
-  // kernel_def Since(6)     Valid
-  // kernel_def Since(5)     Valid
-  // kernel_def Since(4)     Invalid
-  // kernel_def Since(4, 6)  Valid
-
-  // Right now there is no "until version" on schema, it is difficult to get opset version here.(require a lot of interface change.)
-  // As a trade off, we will temporary require kernel definition to have the same since version as schema definition.
-  // so kernel_def Since(6) will become invalid now.
-  // After ONNX add "until version" on the schema object, we will update this place
-  bool valid_version = kernel_start_version == node_since_version  // the idea case this branch should be kernel_start_version >= node_version && kernel_start_version <= until_version
-                       || (kernel_start_version < node_since_version && kernel_end_version != INT_MAX && kernel_end_version >= node_since_version);
-  if (!valid_version) {
-    std::ostringstream ostr;
-    ostr << "Op with name (" << node.Name() << ")"
-         << " and type (" << node.OpType() << ")"
-         << " Version mismatch."
-         << " node_version: " << node_since_version
-         << " kernel start version: " << kernel_start_version
-         << " kernel_end_version: " << kernel_end_version;
-    error_str = ostr.str();
-    return false;
-  }
-
-  // check if type matches
-  auto& kernel_type_constraints = kernel_def.EnabledTypeConstraints();
-
-  // Note: The number of formal input/output parameters is N and the number of
-  // type constraints is M. We select between an O(N*M) and an O(N+M) approach.
-  // The O(N*M) approach has lower initial overhead.
-  // kTypeBindingResolverComplexityThreshold is the value of N*M above which we
-  // will use the O(N+M) approach.
-  constexpr int kTypeBindingResolverComplexityThreshold = 50 * 50;
-  const bool use_lookup_map = (kernel_type_constraints.size() * (node.Op()->inputs().size() + node.Op()->outputs().size()) >
-                               kTypeBindingResolverComplexityThreshold);
-  TypeBindingResolver type_binding_resolver{node, use_lookup_map};
-
-  for (auto& constraint : kernel_type_constraints) {
-    const std::string& name = constraint.first;
-    const std::vector<MLDataType>& allowed_types = constraint.second;
-    const ONNX_NAMESPACE::TypeProto* actual_type = type_binding_resolver.Resolve(name);
-
-    // If actual_type is null, this represents a type-constraint on a
-    // missing optional parameter, which can be skipped.
-    // TODO: We should check that names specified in kernel_type_constraints are
-    // valid names (of types or parameters) at the time that kernels are registered.
-    if (nullptr != actual_type) {
-      bool is_type_compatible = std::any_of(allowed_types.begin(), allowed_types.end(),
-                                            [actual_type](const DataTypeImpl* expected_type) {
-                                              bool rc = expected_type->IsCompatible(*actual_type);  // for easier debugging
-                                              return rc;
-                                            });
-      if (!is_type_compatible) {
-        std::ostringstream ostr;
-        ostr << "Found kernel for Op with name (" << node.Name() << ")"
-             << " and type (" << node.OpType() << ")"
-             << " in the supported version range"
-             << " (node_version: " << node_since_version
-             << " kernel start version: " << kernel_start_version
-             << " kernel_end_version: " << kernel_end_version << ")."
-             << " However the types are incompatible."
-             << " This op has been implemented only for the following types (";
-        for (const auto& allowed_type : allowed_types) {
-          ostr << DataTypeImpl::ToString(allowed_type) << ",";
-        }
-        ostr << "),";
-        const char* actual_type_str = DataTypeImpl::ToString(DataTypeImpl::TypeFromProto(*actual_type));
-        ostr << " but the node in the model has the following type (" << actual_type_str << ")";
-        error_str = ostr.str();
-        return false;
-      }
-    }
-  }
-  return true;
 }
 ```
